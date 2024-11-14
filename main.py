@@ -145,7 +145,26 @@ class GCSConfig:
     @staticmethod
     def initialize_storage_client():
         try:
+            # Primero intenta leer directamente las credenciales como JSON
+            credentials_json = os.getenv('GCS_CREDENTIALS_JSON')
+            if credentials_json:
+                # Convertir el string JSON a diccionario
+                try:
+                    credentials_info = json.loads(credentials_json)
+                    credentials = service_account.Credentials.from_service_account_info(
+                        credentials_info,
+                        scopes=['https://www.googleapis.com/auth/cloud-platform']
+                    )
+                    return storage.Client(credentials=credentials)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Error decodificando JSON de credenciales: {str(e)}")
+                    raise
+
+            # Si no hay JSON, intenta con la ruta del archivo
             credentials_path = os.getenv('GCS_CREDENTIALS_PATH')
+            if not credentials_path:
+                raise ValueError("No se encontraron credenciales de GCS (ni JSON ni ruta de archivo)")
+
             if not os.path.exists(credentials_path):
                 raise FileNotFoundError(f"Archivo de credenciales no encontrado en: {credentials_path}")
 
