@@ -1,1 +1,13 @@
-
+services:
+  - type: web
+    name: instagram-video-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: INSTAGRAM_USERNAME
+        sync: false
+      - key: INSTAGRAM_PASSWORD
+        sync: false
+      - key: GCS_BUCKET_NAME
+        sync: false
