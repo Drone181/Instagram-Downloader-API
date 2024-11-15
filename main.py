@@ -270,6 +270,12 @@ async def download_instagram_video(request: VideoRequest):
         logger.error(f"Error inesperado: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
 
+@app.get("/active-page")
+def active_page():
+    return {
+        "success": True
+    }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
