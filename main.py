@@ -16,6 +16,9 @@ from io import BytesIO
 import json
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+import asyncio
+from typing import Dict, List
 
 # Configurar logging más detallado
 logging.basicConfig(
@@ -37,6 +40,56 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+class VideoCleanupManager:
+    def __init__(self):
+        self.pending_deletions: Dict[str, datetime] = {}
+        self.cleanup_task = None
+        self.logger = logging.getLogger(__name__)
+
+    async def schedule_deletion(self, filename: str, delay_minutes: int = 5):
+        """Programa la eliminación de un video después de un tiempo específico"""
+        deletion_time = datetime.now() + timedelta(minutes=delay_minutes)
+        self.pending_deletions[filename] = deletion_time
+        self.logger.info(f"Programada eliminación de {filename} para {deletion_time}")
+
+    async def cleanup_worker(self):
+        """Worker que verifica y elimina los videos expirados"""
+        while True:
+            try:
+                current_time = datetime.now()
+                files_to_delete = [
+                    filename for filename, deletion_time 
+                    in self.pending_deletions.items() 
+                    if current_time >= deletion_time
+                ]
+
+                for filename in files_to_delete:
+                    try:
+                        await self._delete_file(filename)
+                        del self.pending_deletions[filename]
+                    except Exception as e:
+                        self.logger.error(f"Error al eliminar {filename}: {str(e)}")
+
+                await asyncio.sleep(30)  # Verifica cada 30 segundos
+            except Exception as e:
+                self.logger.error(f"Error en cleanup worker: {str(e)}")
+                await asyncio.sleep(30)
+
+    async def start(self):
+        """Inicia el worker de limpieza"""
+        self.cleanup_task = asyncio.create_task(self.cleanup_worker())
+        self.logger.info("Iniciado el worker de limpieza de videos")
+
+    async def stop(self):
+        """Detiene el worker de limpieza"""
+        if self.cleanup_task:
+            self.cleanup_task.cancel()
+            try:
+                await self.cleanup_task
+            except asyncio.CancelledError:
+                pass
+        self.logger.info("Detenido el worker de limpieza de videos")
 
 class VideoRequest(BaseModel):
     url: str
@@ -220,24 +273,52 @@ class GCSHandler:
         self.bucket_name = os.getenv('GCS_BUCKET_NAME')
         self.bucket = self.client.bucket(self.bucket_name)
         self.executor = ThreadPoolExecutor(max_workers=5)
+        self.cleanup_manager = VideoCleanupManager()
         logger.info(f"GCS Handler inicializado para bucket: {self.bucket_name}")
 
+    async def start_cleanup_manager(self):
+        """Inicia el manager de limpieza"""
+        await self.cleanup_manager.start()
+
+    async def stop_cleanup_manager(self):
+        """Detiene el manager de limpieza"""
+        await self.cleanup_manager.stop()
+
     async def upload_from_memory(self, video_buffer: BytesIO, filename: str) -> str:
-        return await asyncio.get_event_loop().run_in_executor(
+        url = await asyncio.get_event_loop().run_in_executor(
             self.executor,
             self._upload_from_memory_sync,
             video_buffer,
             filename
         )
+        
+        # Programar la eliminación del archivo
+        await self.cleanup_manager.schedule_deletion(filename)
+        
+        return url
+
+    async def delete_file(self, filename: str):
+        """Elimina un archivo del bucket"""
+        try:
+            blob = self.bucket.blob(filename)
+            await asyncio.get_event_loop().run_in_executor(
+                self.executor,
+                blob.delete
+            )
+            logger.info(f"Archivo {filename} eliminado exitosamente")
+        except Exception as e:
+            logger.error(f"Error al eliminar archivo {filename}: {str(e)}")
+            raise
 
     def _upload_from_memory_sync(self, video_buffer: BytesIO, filename: str) -> str:
         try:
             blob = self.bucket.blob(filename)
             blob.upload_from_file(video_buffer, content_type='video/mp4')
             
+            # Generar URL con tiempo de expiración de 5 minutos
             url = blob.generate_signed_url(
                 version="v4",
-                expiration=timedelta(minutes=15),
+                expiration=timedelta(minutes=5),
                 method="GET"
             )
             return url
@@ -254,13 +335,10 @@ gcs_handler = None
 async def startup_event():
     global instagram_handler, gcs_handler
     try:
-        # Inicializar el pool de Instaloader
         await loader_pool.initialize()
-        
-        # Inicializar handlers
         instagram_handler = InstagramHandler(loader_pool)
         gcs_handler = GCSHandler()
-        
+        await gcs_handler.start_cleanup_manager()
         logger.info("Todos los handlers inicializados correctamente")
     except Exception as e:
         logger.error(f"Error durante la inicialización: {str(e)}")
@@ -268,11 +346,12 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    # Limpieza de recursos
     if hasattr(instagram_handler, 'executor'):
         instagram_handler.executor.shutdown(wait=True)
     if hasattr(gcs_handler, 'executor'):
         gcs_handler.executor.shutdown(wait=True)
+    if hasattr(gcs_handler, 'cleanup_manager'):
+        await gcs_handler.stop_cleanup_manager()
 
 async def cleanup_temp_files(temp_files: list):
     """Limpia archivos temporales en background"""
