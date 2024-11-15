@@ -42,10 +42,11 @@ app.add_middleware(
 )
 
 class VideoCleanupManager:
-    def __init__(self):
+    def __init__(self, gcs_handler):
         self.pending_deletions: Dict[str, datetime] = {}
         self.cleanup_task = None
         self.logger = logging.getLogger(__name__)
+        self.gcs_handler = gcs_handler
 
     async def schedule_deletion(self, filename: str, delay_minutes: int = 5):
         """Programa la eliminación de un video después de un tiempo específico"""
@@ -66,8 +67,10 @@ class VideoCleanupManager:
 
                 for filename in files_to_delete:
                     try:
-                        await self._delete_file(filename)
+                        # Eliminar físicamente el archivo del bucket
+                        await self.gcs_handler.delete_file(filename)
                         del self.pending_deletions[filename]
+                        self.logger.info(f"Archivo {filename} eliminado exitosamente del bucket")
                     except Exception as e:
                         self.logger.error(f"Error al eliminar {filename}: {str(e)}")
 
@@ -273,16 +276,18 @@ class GCSHandler:
         self.bucket_name = os.getenv('GCS_BUCKET_NAME')
         self.bucket = self.client.bucket(self.bucket_name)
         self.executor = ThreadPoolExecutor(max_workers=5)
-        self.cleanup_manager = VideoCleanupManager()
+        self.cleanup_manager = None  # Se inicializará después para evitar referencia circular
         logger.info(f"GCS Handler inicializado para bucket: {self.bucket_name}")
 
-    async def start_cleanup_manager(self):
-        """Inicia el manager de limpieza"""
+    async def initialize_cleanup_manager(self):
+        """Inicializa el manager de limpieza"""
+        self.cleanup_manager = VideoCleanupManager(self)
         await self.cleanup_manager.start()
 
     async def stop_cleanup_manager(self):
         """Detiene el manager de limpieza"""
-        await self.cleanup_manager.stop()
+        if self.cleanup_manager:
+            await self.cleanup_manager.stop()
 
     async def upload_from_memory(self, video_buffer: BytesIO, filename: str) -> str:
         url = await asyncio.get_event_loop().run_in_executor(
@@ -293,19 +298,29 @@ class GCSHandler:
         )
         
         # Programar la eliminación del archivo
-        await self.cleanup_manager.schedule_deletion(filename)
+        if self.cleanup_manager:
+            await self.cleanup_manager.schedule_deletion(filename)
         
         return url
 
     async def delete_file(self, filename: str):
-        """Elimina un archivo del bucket"""
+        """Elimina físicamente un archivo del bucket"""
         try:
             blob = self.bucket.blob(filename)
-            await asyncio.get_event_loop().run_in_executor(
+            exists = await asyncio.get_event_loop().run_in_executor(
                 self.executor,
-                blob.delete
+                blob.exists
             )
-            logger.info(f"Archivo {filename} eliminado exitosamente")
+            
+            if exists:
+                await asyncio.get_event_loop().run_in_executor(
+                    self.executor,
+                    blob.delete
+                )
+                logger.info(f"Archivo {filename} eliminado físicamente del bucket")
+            else:
+                logger.warning(f"El archivo {filename} ya no existe en el bucket")
+                
         except Exception as e:
             logger.error(f"Error al eliminar archivo {filename}: {str(e)}")
             raise
@@ -335,10 +350,16 @@ gcs_handler = None
 async def startup_event():
     global instagram_handler, gcs_handler
     try:
+        # Inicializar el pool de Instaloader
         await loader_pool.initialize()
+        
+        # Inicializar handlers
         instagram_handler = InstagramHandler(loader_pool)
         gcs_handler = GCSHandler()
-        await gcs_handler.start_cleanup_manager()
+        
+        # Inicializar el cleanup manager
+        await gcs_handler.initialize_cleanup_manager()
+        
         logger.info("Todos los handlers inicializados correctamente")
     except Exception as e:
         logger.error(f"Error durante la inicialización: {str(e)}")
@@ -346,6 +367,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    # Limpieza de recursos
     if hasattr(instagram_handler, 'executor'):
         instagram_handler.executor.shutdown(wait=True)
     if hasattr(gcs_handler, 'executor'):
